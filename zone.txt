@@ -2,3 +2,5 @@ piyushgarg.dev        300 IN A      1.2.3.4
 piyushgarg.dev        300 IN A      3.4.5.6
 piyushgarg.dev        300 IN TXT    "hello from custom dns"
 blog.piyushgarg.dev   300 IN CNAME  piyushgarg.dev
+contact.piyushgarg.dev 300 IN CNAME blog.piyushgarg.dev
+about.piyushgarg.dev 300 IN CNAME contact.piyushgarg.dev

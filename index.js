@@ -41,12 +41,66 @@ server.on('message', (msg, rinfo) => {
     const domain = incomingreq.questions[0].name
     const type = incomingreq.questions[0].type
     const ipFromDb = db[domain]?.[type]
-    console.log(ipFromDb)
+    let mainDomain;
 
-
-
-    // check if it is in cache
     if (!ipFromDb) {
+        const domainEntry = db[domain]
+        // check if domain exists and has CNAME
+        if (domainEntry && domainEntry["CNAME"]) {
+            let visitedDomain = new Set()
+            let aliasDomain = domainEntry["CNAME"][0]; // extract string from array
+            let targetA = db[aliasDomain]?.["A"];
+
+            
+
+            while (!targetA){
+                if (visitedDomain.has(aliasDomain)){
+                    return
+                }
+                visitedDomain.add(aliasDomain)
+                aliasDomain = db[aliasDomain]?.["CNAME"]?.[0]
+                targetA = db[aliasDomain]?.["A"]
+                console.log(aliasDomain, targetA)
+            }
+
+            if (targetA) {
+                const answers = [
+                    // CNAME record
+                    {
+                        type: 'CNAME',
+                        name: domain,
+                        class: 'IN',
+                        ttl: 300,
+                        data: aliasDomain
+                    },
+                    // A record of target
+                    ...targetA.map(ip => ({
+                        type: 'A',
+                        name: aliasDomain,
+                        class: 'IN',
+                        ttl: 300,
+                        data: ip
+                    }))
+                ];
+
+                const ans = dnsPacket.encode({
+                    id: incomingreq.id,
+                    type: 'response',
+                    flags: dnsPacket.AUTHORITATIVE_ANSWER,
+                    questions: incomingreq.questions,
+                    answers
+                });
+
+                server.send(ans, rinfo.port, rinfo.address);
+                return;
+            }
+        }
+    }
+
+
+
+    if (!mainDomain) {
+        // check if it is in cache
         const cached = cache.get(`${domain}:${type}`)
 
         if (cached && cached.expiresAt > Date.now()) {
@@ -75,9 +129,9 @@ server.on('message', (msg, rinfo) => {
         return
     }
 
-    
-    
-    
+
+
+
     const records = Array.isArray(ipFromDb) ? ipFromDb : [ipFromDb]
     // if not cached and my database has the record
     const ans = dnsPacket.encode({
@@ -97,7 +151,7 @@ server.on('message', (msg, rinfo) => {
         msg: incomingreq.questions,
         rinfo
     });
-    
+
     // sends the ip address of the domain that is received from the packet
     server.send(ans, rinfo.port, rinfo.address)
 })
@@ -106,7 +160,7 @@ upstream.on("message", (response) => {
     const decoded = dnsPacket.decode(response)
     const request = pendingRequests.get(decoded.id)
 
-    if(!request) return 
+    if (!request) return
 
     const ttl = decoded.answers?.[0]?.ttl || 300
     cache.set(`${request.domain}:${request.type}`, {
