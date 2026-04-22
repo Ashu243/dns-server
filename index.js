@@ -3,12 +3,14 @@ const server = dgram.createSocket('udp4');
 const dnsPacket = require('dns-packet');
 const upstream = dgram.createSocket('udp4');
 const fs = require('fs');
+const { decode } = require('node:punycode');
 
 // ---------------- LOAD ZONE ----------------
 const zoneData = fs.readFileSync("zone.txt", 'utf-8');
 const lines = zoneData.split("\n");
 
 const db = {};
+const googleForwarding = true
 
 for (const line of lines) {
     if (!line.trim()) continue;
@@ -142,14 +144,30 @@ server.on('message', (msg, rinfo) => {
 
     // ---------------- 5. FORWARD ----------------
     if (!db[domain]) {
+        // if(!googleForwarding){
+        //     const ans = dnsPacket.encode({
+        //         id: incomingreq.id,
+        //         type: type,
+        //         rcode: "NXDOMAIN",
+        //         questions: incomingreq.questions
+        //     })
+
+        //     server.send(ans, rinfo.port, rinfo.address)
+        //     return
+
+        // }
+        
+        
         pendingRequests.set(incomingreq.id, {
             domain,
             type,
             port: rinfo.port,
-            address: rinfo.address
+            address: rinfo.address,
+            originalQuery: msg
         });
-
-        upstream.send(msg, 53, '8.8.8.8');
+        
+        const ROOT_SERVER = '198.41.0.4';
+        upstream.send(msg, 53, ROOT_SERVER);
 
         // timeout
         setTimeout(() => {
@@ -175,20 +193,59 @@ server.on('message', (msg, rinfo) => {
 // ---------------- UPSTREAM RESPONSE ----------------
 upstream.on("message", (response) => {
     const decoded = dnsPacket.decode(response);
+    // console.log(decoded)
     const request = pendingRequests.get(decoded.id);
 
     if (!request) return;
 
-    const ttl = decoded.answers?.[0]?.ttl || 300;
+    function nextServerIp(decoded){
+        if(decoded.additionals){
+            for (const record of decoded.additionals){
+                if (record.type == "A"){
+                    return record.data
+                }
+            }
+        }
+        return null
+    }
 
-    cache.set(`${request.domain}:${request.type}`, {
-        answers: decoded.answers,
-        rcode: decoded.rcode,
-        expiresAt: Date.now() + ttl * 1000
-    });
 
-    server.send(response, request.port, request.address);
-    pendingRequests.delete(decoded.id);
+    // if the response is final 
+    if (decoded.answers && decoded.answers.length > 0){
+        const ttl = decoded.answers?.[0]?.ttl || 300;
+    
+        cache.set(`${request.domain}:${request.type}`, {
+            answers: decoded.answers,
+            rcode: decoded.rcode,
+            expiresAt: Date.now() + ttl * 1000
+        });
+    
+        server.send(response, request.port, request.address);
+        pendingRequests.delete(decoded.id);
+        return
+    }
+
+    const nextIP = nextServerIp(decoded)
+    if (nextIP){
+        console.log("querying the next server: ", nextIP)
+        upstream.send(request.originalQuery, 53, nextIP)
+        return
+    }
+
+    console.log('No server found, failing')
+
+    const res = dnsPacket.encode({
+        id: decoded.id,
+        type: "response",
+        rcode: "SERVERFAIL",
+        questions: [{name: request.domain, type: request.type}]
+    })
+
+
+    server.send(res, request.port, request.address)
+    return
+
+
 });
 
 // ---------------- START SERVER ----------------
