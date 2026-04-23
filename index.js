@@ -1,16 +1,14 @@
 const dgram = require('node:dgram');
-const server = dgram.createSocket('udp4');
 const dnsPacket = require('dns-packet');
-const upstream = dgram.createSocket('udp4');
 const fs = require('fs');
-const { decode } = require('node:punycode');
+
+const server = dgram.createSocket('udp4');
 
 // ---------------- LOAD ZONE ----------------
 const zoneData = fs.readFileSync("zone.txt", 'utf-8');
 const lines = zoneData.split("\n");
 
 const db = {};
-const googleForwarding = true
 
 for (const line of lines) {
     if (!line.trim()) continue;
@@ -28,10 +26,100 @@ for (const line of lines) {
 
 // ---------------- CACHE ----------------
 const cache = new Map();
-const pendingRequests = new Map();
+
+// ---------------- QUERY FUNCTION ----------------
+function queryDNS(serverIP, domain, type = "A") {
+    return new Promise((resolve, reject) => {
+        const socket = dgram.createSocket("udp4");
+        const id = Math.floor(Math.random() * 65535);
+
+        const query = dnsPacket.encode({
+            type: "query",
+            id,
+            questions: [{ type, name: domain }]
+        });
+
+        socket.send(query, 53, serverIP);
+
+        const timeout = setTimeout(() => {
+            socket.close();
+            reject(new Error("Timeout"));
+        }, 2000);
+
+        socket.on("message", (msg) => {
+            const decoded = dnsPacket.decode(msg);
+
+            if (decoded.id === id) {
+                clearTimeout(timeout);
+                socket.close();
+                resolve(decoded);
+            }
+        });
+    });
+}
+
+// ---------------- RECURSIVE RESOLVER ----------------
+async function resolveDomain(domain, type = "A", visited = new Set()) {
+
+    if (visited.has(domain)) {
+        console.log("Loop detected:", domain);
+        return null;
+    }
+
+    visited.add(domain);
+
+    let currentServer = "198.41.0.4"; // root server
+
+    while (true) {
+        let response;
+
+        try {
+            response = await queryDNS(currentServer, domain, type);
+        } catch (err) {
+            console.log("Query failed:", err.message);
+            return null;
+        }
+
+        //  Final answer
+        if (response.answers && response.answers.length > 0) {
+            const answer = response.answers.find(r => r.type === type);
+            if (answer) return answer.data;
+        }
+
+        // Use additionals (fast path)
+        if (response.additionals && response.additionals.length > 0) {
+            const record = response.additionals.find(r => r.type === "A");
+            if (record) {
+                currentServer = record.data;
+                continue;
+            }
+        }
+
+        //  Resolve NS if no additionals
+        const nsRecords = response.authorities?.filter(r => r.type === "NS");
+
+        if (nsRecords && nsRecords.length > 0) {
+            let found = false;
+
+            for (const ns of nsRecords) {
+                const nsIP = await resolveDomain(ns.data, "A", visited);
+
+                if (nsIP) {
+                    currentServer = nsIP;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (found) continue;
+        }
+
+        return null;
+    }
+}
 
 // ---------------- SERVER ----------------
-server.on('message', (msg, rinfo) => {
+server.on('message', async (msg, rinfo) => {
     const incomingreq = dnsPacket.decode(msg);
     const question = incomingreq.questions?.[0];
 
@@ -40,7 +128,23 @@ server.on('message', (msg, rinfo) => {
     const domain = question.name;
     const type = question.type;
 
-    // ---------------- 1> EXACT MATCH ----------------
+    const cacheKey = `${domain}:${type}`;
+
+    // ---------------- CACHE ----------------
+    const cached = cache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+        const res = dnsPacket.encode({
+            id: incomingreq.id,
+            type: 'response',
+            questions: incomingreq.questions,
+            answers: cached.answers
+        });
+
+        server.send(res, rinfo.port, rinfo.address);
+        return;
+    }
+
+    // ---------------- AUTHORITATIVE ----------------
     if (db[domain]?.[type]) {
         const answers = db[domain][type].map(val => ({
             type,
@@ -62,44 +166,30 @@ server.on('message', (msg, rinfo) => {
         return;
     }
 
-    // ---------------- 2> CNAME RESOLUTION ----------------
+    // ---------------- CNAME ----------------
     if (db[domain]?.["CNAME"]) {
-        let visited = new Set();
-        let current = domain;
-        let targetA = null;
+        let current = db[domain]["CNAME"][0];
+        const ip = await resolveDomain(current, "A");
 
-        while (db[current]?.["CNAME"]) {
-            if (visited.has(current)) break;
-            visited.add(current);
-
-            current = db[current]["CNAME"][0];
-            targetA = db[current]?.["A"];
-
-            if (targetA) break;
-        }
-
-        if (targetA) {
+        if (ip) {
             const answers = [
                 {
-                    type: 'CNAME',
+                    type: "CNAME",
                     name: domain,
-                    class: 'IN',
-                    ttl: 300,
-                    data: current
+                    data: current,
+                    ttl: 300
                 },
-                ...targetA.map(ip => ({
-                    type: 'A',
+                {
+                    type: "A",
                     name: current,
-                    class: 'IN',
-                    ttl: 300,
-                    data: ip
-                }))
+                    data: ip,
+                    ttl: 300
+                }
             ];
 
             const res = dnsPacket.encode({
                 id: incomingreq.id,
                 type: 'response',
-                flags: dnsPacket.AUTHORITATIVE_ANSWER,
                 questions: incomingreq.questions,
                 answers
             });
@@ -109,146 +199,43 @@ server.on('message', (msg, rinfo) => {
         }
     }
 
-    // ---------------- 3> NODATA ----------------
-    if (db[domain] && !db[domain][type]) {
-        const res = dnsPacket.encode({
-            id: incomingreq.id,
-            type: 'response',
-            flags: dnsPacket.AUTHORITATIVE_ANSWER,
-            rcode: 'NOERROR',
-            questions: incomingreq.questions,
-            answers: []
-        });
+    // ---------------- RECURSIVE RESOLUTION ----------------
+    const ip = await resolveDomain(domain, type);
 
-        server.send(res, rinfo.port, rinfo.address);
-        return;
-    }
-
-    // ---------------- 4. CACHE ----------------
-    const cacheKey = `${domain}:${type}`;
-    const cached = cache.get(cacheKey);
-
-    if (cached && cached.expiresAt > Date.now()) {
-        const res = dnsPacket.encode({
-            id: incomingreq.id,
-            type: 'response',
-            flags: dnsPacket.AUTHORITATIVE_ANSWER,
-            rcode: cached.rcode,
-            questions: incomingreq.questions,
-            answers: cached.answers
-        });
-
-        server.send(res, rinfo.port, rinfo.address);
-        return;
-    }
-
-    // ---------------- 5. FORWARD ----------------
-    if (!db[domain]) {
-        // if(!googleForwarding){
-        //     const ans = dnsPacket.encode({
-        //         id: incomingreq.id,
-        //         type: type,
-        //         rcode: "NXDOMAIN",
-        //         questions: incomingreq.questions
-        //     })
-
-        //     server.send(ans, rinfo.port, rinfo.address)
-        //     return
-
-        // }
-        
-        
-        pendingRequests.set(incomingreq.id, {
-            domain,
+    if (ip) {
+        const answers = [{
             type,
-            port: rinfo.port,
-            address: rinfo.address,
-            originalQuery: msg
+            name: domain,
+            ttl: 300,
+            data: ip
+        }];
+
+        cache.set(cacheKey, {
+            answers,
+            expiresAt: Date.now() + 300 * 1000
         });
-        
-        const ROOT_SERVER = '198.41.0.4';
-        upstream.send(msg, 53, ROOT_SERVER);
 
-        // timeout
-        setTimeout(() => {
-            if (pendingRequests.has(incomingreq.id)) {
-                pendingRequests.delete(incomingreq.id);
+        const res = dnsPacket.encode({
+            id: incomingreq.id,
+            type: 'response',
+            questions: incomingreq.questions,
+            answers
+        });
 
-                const res = dnsPacket.encode({
-                    id: incomingreq.id,
-                    type: 'response',
-                    flags: dnsPacket.AUTHORITATIVE_ANSWER,
-                    rcode: 'SERVFAIL',
-                    questions: incomingreq.questions
-                });
+        server.send(res, rinfo.port, rinfo.address);
+    } else {
+        const res = dnsPacket.encode({
+            id: incomingreq.id,
+            type: 'response',
+            rcode: 'SERVFAIL',
+            questions: incomingreq.questions
+        });
 
-                server.send(res, rinfo.port, rinfo.address);
-            }
-        }, 3000);
-
-        return;
+        server.send(res, rinfo.port, rinfo.address);
     }
 });
 
-// ---------------- UPSTREAM RESPONSE ----------------
-upstream.on("message", (response) => {
-    const decoded = dnsPacket.decode(response);
-    // console.log(decoded)
-    const request = pendingRequests.get(decoded.id);
-
-    if (!request) return;
-
-    function nextServerIp(decoded){
-        if(decoded.additionals){
-            for (const record of decoded.additionals){
-                if (record.type == "A"){
-                    return record.data
-                }
-            }
-        }
-        return null
-    }
-
-
-    // if the response is final 
-    if (decoded.answers && decoded.answers.length > 0){
-        const ttl = decoded.answers?.[0]?.ttl || 300;
-    
-        cache.set(`${request.domain}:${request.type}`, {
-            answers: decoded.answers,
-            rcode: decoded.rcode,
-            expiresAt: Date.now() + ttl * 1000
-        });
-    
-        server.send(response, request.port, request.address);
-        pendingRequests.delete(decoded.id);
-        return
-    }
-
-    const nextIP = nextServerIp(decoded)
-    if (nextIP){
-        console.log("querying the next server: ", nextIP)
-        upstream.send(request.originalQuery, 53, nextIP)
-        return
-    }
-
-    console.log('No server found, failing')
-
-    const res = dnsPacket.encode({
-        id: decoded.id,
-        type: "response",
-        rcode: "SERVERFAIL",
-        questions: [{name: request.domain, type: request.type}]
-    })
-
-
-    server.send(res, request.port, request.address)
-    return
-
-
-});
-
-// ---------------- START SERVER ----------------
+// ---------------- START ----------------
 server.bind(53, () => {
     console.log('DNS server running on port 53');
 });
